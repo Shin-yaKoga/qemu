@@ -641,3 +641,9 @@ config ARMSSE
     select UNIMP
     select SSE_COUNTER
     select SSE_TIMER
+
+config SCSAT1
+    bool
+    default y if TCG && ARM
+    select I2C
+    select SERIAL
