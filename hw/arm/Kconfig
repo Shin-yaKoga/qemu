@@ -645,5 +645,5 @@ config ARMSSE
 config SCSAT1
     bool
     default y if TCG && ARM
-    select I2C
+    select SC_OBC_I2C
     select SERIAL
