@@ -1,8 +1,53 @@
 #include "qemu/osdep.h"
-#include "hw/i2c/sc_obc_i2c.h"
-#include "qemu/log.h"
+#include "hw/i2c/sc_i2cm.h"
 #include "hw/irq.h"
+#include "hw/sysbus.h"
+#include "qemu/log.h"
 #include "migration/vmstate.h"
+
+
+#define SC_I2CM_FIFO_SIZE 16
+
+typedef struct I2cFifo {
+    uint8_t     ringbuf[SC_I2CM_FIFO_SIZE];
+    uint32_t    rpos;
+    uint32_t    wpos;
+} I2cFifo;
+
+struct SC_I2CM_State {
+    SysBusDevice    parent_obj;
+
+    I2CBus* bus;
+    qemu_irq    irq;
+    MemoryRegion    iomem;
+    uint32_t    ier_shadow_mask;
+    I2cFifo     tx_fifo;  /* actually, never used */
+    I2cFifo     rx_fifo;
+    uint32_t    i2cm_status;
+    uint8_t     curr_slave_addr;
+    uint32_t    requested_bytes;
+    uint32_t    received_bytes;
+    bool        stop_after_recv;
+    uint32_t    enr;
+    uint32_t    txfifor;
+    uint32_t    bsr;
+    uint32_t    isr;
+    uint32_t    ier;
+    uint32_t    fifosr;
+    uint32_t    fiforr;
+    uint32_t    ftlsr;
+    uint32_t    scltsr;
+    uint32_t    thdstar;
+    uint32_t    tsustor;
+    uint32_t    tsustar;
+    uint32_t    thighr;
+    uint32_t    thddatr;
+    uint32_t    tsudatr;
+    uint32_t    tbufr;
+    uint32_t    tbsmplr;
+    uint32_t    bfsr;
+};
+OBJECT_DECLARE_SIMPLE_TYPE(SC_I2CM_State, SC_I2CM)
 
 
 static void i2c_fifo_init(I2cFifo* fifo)
@@ -18,12 +63,12 @@ static uint32_t i2c_fifo_count(I2cFifo* fifo)
 
 static bool i2c_fifo_is_full(I2cFifo* fifo)
 {
-    return (i2c_fifo_count(fifo) >= SCOBC_I2C_FIFO_SIZE);
+    return (i2c_fifo_count(fifo) >= SC_I2CM_FIFO_SIZE);
 }
 
 static uint8_t  i2c_fifo_read(I2cFifo* fifo)
 {
-    uint8_t val = fifo->ringbuf[fifo->rpos % SCOBC_I2C_FIFO_SIZE];
+    uint8_t val = fifo->ringbuf[fifo->rpos % SC_I2CM_FIFO_SIZE];
 
     if (i2c_fifo_count(fifo) > 0) {
         fifo->rpos += 1;
@@ -34,29 +79,29 @@ static uint8_t  i2c_fifo_read(I2cFifo* fifo)
 
 static bool i2c_fifo_write(I2cFifo* fifo, uint8_t val)
 {
-    if (i2c_fifo_count(fifo) == SCOBC_I2C_FIFO_SIZE) {
+    if (i2c_fifo_count(fifo) == SC_I2CM_FIFO_SIZE) {
         return false;  /* buffer is full */
     } else {
-        fifo->ringbuf[fifo->wpos++ % SCOBC_I2C_FIFO_SIZE] = val;
+        fifo->ringbuf[fifo->wpos++ % SC_I2CM_FIFO_SIZE] = val;
         return true;
     }
 }
 
 /* I2CM_ISR, I2CM_IER register field's bits */
-#define SCOBC_I2CM_INTR_SCLTO       12
-#define SCOBC_I2CM_INTR_RXFIFOUDF   11
-#define SCOBC_I2CM_INTR_TXFIFOOVF   10
-#define SCOBC_I2CM_INTR_RXFIFOOTH    5
-#define SCOBC_I2CM_INTR_TXFIFOUTH    4
-#define SCOBC_I2CM_INTR_COMP         0
+#define SC_I2CM_INTR_SCLTO       12
+#define SC_I2CM_INTR_RXFIFOUDF   11
+#define SC_I2CM_INTR_TXFIFOOVF   10
+#define SC_I2CM_INTR_RXFIFOOTH    5
+#define SC_I2CM_INTR_TXFIFOUTH    4
+#define SC_I2CM_INTR_COMP         0
 
 /* I2CM_BSR register field's bits */
-#define SCOBC_I2CM_BSR_OTHERBUSY    1
-#define SCOBC_I2CM_BSR_SELFBUSY     0
+#define SC_I2CM_BSR_OTHERBUSY    1
+#define SC_I2CM_BSR_SELFBUSY     0
 
 /* I2CM_TXFIFOR register field's bits */
-#define SCOBC_I2CM_RESTART  9
-#define SCOBC_I2CM_STOP     8
+#define SC_I2CM_RESTART  9
+#define SC_I2CM_STOP     8
 
 /* ScObcI2cState.i2cm_status */
 typedef enum {
@@ -66,14 +111,14 @@ typedef enum {
     I2CM_STAT_IN_RECEIVING,
 } EI2cmStatus;
 
-static void scobc_i2c_do_try_irq_raise(SCObcI2cState* s)
+static void sc_i2cm_do_try_irq_raise(SC_I2CM_State* s)
 {
     if (((s->isr & s->ier) & s->ier_shadow_mask) != 0) {
         qemu_irq_raise(s->irq);
     }
 }
 
-static uint8_t  scobc_i2c_do_read_and_recv(SCObcI2cState* s)
+static uint8_t  sc_i2cm_do_read_and_recv(SC_I2CM_State* s)
 {
     uint8_t val = i2c_fifo_read(&s->rx_fifo);
 
@@ -84,8 +129,8 @@ static uint8_t  scobc_i2c_do_read_and_recv(SCObcI2cState* s)
             i2c_end_transfer(s->bus);
             s->i2cm_status = I2CM_STAT_IDLE;
             if (s->stop_after_recv) {
-                s->isr |= (1UL << SCOBC_I2CM_INTR_COMP);
-                scobc_i2c_do_try_irq_raise(s);
+                s->isr |= (1UL << SC_I2CM_INTR_COMP);
+                sc_i2cm_do_try_irq_raise(s);
             }
         }
     }
@@ -93,7 +138,7 @@ static uint8_t  scobc_i2c_do_read_and_recv(SCObcI2cState* s)
     return val;
 }
 
-static void scobc_i2c_do_write_and_send(SCObcI2cState* s, uint32_t value)
+static void sc_i2cm_do_write_and_send(SC_I2CM_State* s, uint32_t value)
 {
     switch (s->i2cm_status) {
     case I2CM_STAT_IDLE:
@@ -118,11 +163,11 @@ static void scobc_i2c_do_write_and_send(SCObcI2cState* s, uint32_t value)
             // xxx
             return;
         }
-        if (value & (1UL << SCOBC_I2CM_STOP)) {
+        if (value & (1UL << SC_I2CM_STOP)) {
             i2c_end_transfer(s->bus);
             s->i2cm_status = I2CM_STAT_IDLE;
-            s->isr |= (1UL << SCOBC_I2CM_INTR_COMP);
-        } else if (value & (1UL << SCOBC_I2CM_RESTART)) {
+            s->isr |= (1UL << SC_I2CM_INTR_COMP);
+        } else if (value & (1UL << SC_I2CM_RESTART)) {
             i2c_end_transfer(s->bus);
             s->i2cm_status = I2CM_STAT_IDLE;
         }
@@ -131,16 +176,16 @@ static void scobc_i2c_do_write_and_send(SCObcI2cState* s, uint32_t value)
         s->requested_bytes = (uint8_t)value + 1;
         s->received_bytes = 0;
         i2c_fifo_init(&s->rx_fifo);
-        s->stop_after_recv = (0 != (value & (1UL << SCOBC_I2CM_STOP)));
+        s->stop_after_recv = (0 != (value & (1UL << SC_I2CM_STOP)));
         s->i2cm_status = I2CM_STAT_IN_RECEIVING;
-        for (uint32_t i = 0; i < SCOBC_I2C_FIFO_SIZE; ++i) {
+        for (uint32_t i = 0; i < SC_I2CM_FIFO_SIZE; ++i) {
             (void)i2c_fifo_write(&s->rx_fifo, i2c_recv(s->bus));
             if (++(s->received_bytes) == s->requested_bytes) {
                 i2c_end_transfer(s->bus);
                 s->i2cm_status = I2CM_STAT_IDLE;
                 if (s->stop_after_recv) {
-                    s->isr |= (1UL << SCOBC_I2CM_INTR_COMP);
-                    scobc_i2c_do_try_irq_raise(s);
+                    s->isr |= (1UL << SC_I2CM_INTR_COMP);
+                    sc_i2cm_do_try_irq_raise(s);
                 }
                 break;
             }
@@ -162,16 +207,16 @@ static void scobc_i2c_do_write_and_send(SCObcI2cState* s, uint32_t value)
     }
 }
 
-static void scobc_i2c_update(SCObcI2cState* s)
+static void sc_i2cm_update(SC_I2CM_State* s)
 {
     int level = ((s->isr & s->ier) & s->ier_shadow_mask) != 0;
 
     qemu_set_irq(s->irq, level);
 }
 
-static uint64_t scobc_i2c_read(void* opaque, hwaddr offset, unsigned size)
+static uint64_t sc_i2cm_read(void* opaque, hwaddr offset, unsigned size)
 {
-    SCObcI2cState* s = (SCObcI2cState*)opaque;
+    SC_I2CM_State* s = (SC_I2CM_State*)opaque;
 
     switch (offset) {
     case 0x0000: /* I2CM_ENR */
@@ -180,19 +225,19 @@ static uint64_t scobc_i2c_read(void* opaque, hwaddr offset, unsigned size)
         return 0;  /* WO */
     case 0x0008: /* I2CM_RXFIFOR */
         if (0 == i2c_fifo_count(&s->rx_fifo)) {
-            s->isr |= (1UL << SCOBC_I2CM_INTR_RXFIFOUDF);
-            scobc_i2c_do_try_irq_raise(s);
+            s->isr |= (1UL << SC_I2CM_INTR_RXFIFOUDF);
+            sc_i2cm_do_try_irq_raise(s);
             return 0;  /* as Undefined value */
         } else {
-            return scobc_i2c_do_read_and_recv(s);
+            return sc_i2cm_do_read_and_recv(s);
         }
     case 0x000C: /* I2CM_BSR */
         s->bsr = 0;
         if (s->i2cm_status != I2CM_STAT_IDLE) {
-            s->bsr |= (1UL << SCOBC_I2CM_BSR_SELFBUSY);
+            s->bsr |= (1UL << SC_I2CM_BSR_SELFBUSY);
         }
         if (i2c_bus_busy(s->bus)) {
-            s->bsr |= (1UL << SCOBC_I2CM_BSR_OTHERBUSY);
+            s->bsr |= (1UL << SC_I2CM_BSR_OTHERBUSY);
         }
         return s->bsr;
     case 0x0010: /* I2CM_ISR */
@@ -232,14 +277,14 @@ static uint64_t scobc_i2c_read(void* opaque, hwaddr offset, unsigned size)
         return 0x01000000;  /* 1.0-p0 */
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
-            "scobc_i2c_read: read at bad offset 0x%lu\n", offset);
+            "sc_i2cm_read: read at bad offset 0x%lu\n", offset);
         return 0;
     }
 }
 
-static void scobc_i2c_write(void* opaque, hwaddr offset, uint64_t value, unsigned size)
+static void sc_i2cm_write(void* opaque, hwaddr offset, uint64_t value, unsigned size)
 {
-    SCObcI2cState* s = (SCObcI2cState*)opaque;
+    SC_I2CM_State* s = (SC_I2CM_State*)opaque;
 
     switch (offset) {
     case 0x0000: /* I2CM_ENR */
@@ -247,10 +292,10 @@ static void scobc_i2c_write(void* opaque, hwaddr offset, uint64_t value, unsigne
         break;
     case 0x0004: /* I2CM_TXFIFOR */
         if (i2c_fifo_is_full(&s->tx_fifo)) {
-            s->isr |= (1UL << SCOBC_I2CM_INTR_TXFIFOOVF);
-            scobc_i2c_do_try_irq_raise(s);
+            s->isr |= (1UL << SC_I2CM_INTR_TXFIFOOVF);
+            sc_i2cm_do_try_irq_raise(s);
         } else {
-            scobc_i2c_do_write_and_send(s, (uint32_t)value);
+            sc_i2cm_do_write_and_send(s, (uint32_t)value);
         }
         break;
     case 0x0008: /* I2CM_RXFIFOR */
@@ -269,15 +314,15 @@ static void scobc_i2c_write(void* opaque, hwaddr offset, uint64_t value, unsigne
             /* clear RXFIFO */
             i2c_fifo_init(&s->rx_fifo);
             s->isr &= ~(
-                (1UL << SCOBC_I2CM_INTR_RXFIFOUDF) |
-                (1UL << SCOBC_I2CM_INTR_RXFIFOOTH));
+                (1UL << SC_I2CM_INTR_RXFIFOUDF) |
+                (1UL << SC_I2CM_INTR_RXFIFOOTH));
         }
         if (value & 0x1) {
             /* clear TXFIFO */
             i2c_fifo_init(&s->tx_fifo);
             s->isr &= ~(
-                (1UL << SCOBC_I2CM_INTR_TXFIFOOVF) |
-                (1UL << SCOBC_I2CM_INTR_TXFIFOUTH));
+                (1UL << SC_I2CM_INTR_TXFIFOOVF) |
+                (1UL << SC_I2CM_INTR_TXFIFOUTH));
         }
         break;
     case 0x0020: /* I2CM_FTLSR */
@@ -285,19 +330,19 @@ static void scobc_i2c_write(void* opaque, hwaddr offset, uint64_t value, unsigne
         if (((s->ftlsr & 0x001F0000) == 0) ||
             ((s->ftlsr & 0x001F0000) == 0x001F0000)) {
             /* disable I2CM_RXFIFOOTH */
-            s->ier_shadow_mask &= ~(1UL << SCOBC_I2CM_INTR_RXFIFOOTH);
+            s->ier_shadow_mask &= ~(1UL << SC_I2CM_INTR_RXFIFOOTH);
         }
         if (((s->ftlsr & 0x0000001F) == 0) ||
             ((s->ftlsr & 0x0000001F) == 0x0000001F)) {
             /* disable I2CM_TXFIFOUTH */
-            s->ier_shadow_mask &= ~(1UL << SCOBC_I2CM_INTR_TXFIFOUTH);
+            s->ier_shadow_mask &= ~(1UL << SC_I2CM_INTR_TXFIFOUTH);
         }
         break;
     case 0x0024: /* I2CM_SCLTSR */
         s->scltsr = value & 0x0000FFFF;
         if (s->scltsr == 0) {
             /* disable I2CM_SCLTO */
-            s->ier_shadow_mask &= ~(1UL << SCOBC_I2CM_INTR_SCLTO);
+            s->ier_shadow_mask &= ~(1UL << SC_I2CM_INTR_SCLTO);
         }
         break;
     case 0x0030: /* I2CM_THDSTAR */
@@ -352,15 +397,15 @@ static void scobc_i2c_write(void* opaque, hwaddr offset, uint64_t value, unsigne
         return;  /* RO */
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
-            "scobc_i2c_write: write at bad offset 0x%lu\n", offset);
+            "sc_i2cm_write: write at bad offset 0x%lu\n", offset);
         return;
     }
-    scobc_i2c_update(s);
+    sc_i2cm_update(s);
 }
 
-static const MemoryRegionOps    scobc_i2c_ops = {
-    .read = scobc_i2c_read,
-    .write = scobc_i2c_write,
+static const MemoryRegionOps    sc_i2cm_ops = {
+    .read = sc_i2cm_read,
+    .write = sc_i2cm_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
@@ -369,32 +414,32 @@ static const VMStateDescription vmstate_scobc_i2c = {
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT32(enr,       SCObcI2cState),
-        VMSTATE_UINT32(txfifor,   SCObcI2cState),
-        VMSTATE_UINT32(bsr,       SCObcI2cState),
-        VMSTATE_UINT32(isr,       SCObcI2cState),
-        VMSTATE_UINT32(ier,       SCObcI2cState),
-        VMSTATE_UINT32(fifosr,    SCObcI2cState),
-        VMSTATE_UINT32(fiforr,    SCObcI2cState),
-        VMSTATE_UINT32(ftlsr,     SCObcI2cState),
-        VMSTATE_UINT32(scltsr,    SCObcI2cState),
-        VMSTATE_UINT32_V(thdstar, SCObcI2cState, 0x000000EF),
-        VMSTATE_UINT32_V(tsustor, SCObcI2cState, 0x000000EF),
-        VMSTATE_UINT32_V(tsustar, SCObcI2cState, 0x00000117),
-        VMSTATE_UINT32_V(thighr,  SCObcI2cState, 0x000000E5),
-        VMSTATE_UINT32_V(thddatr, SCObcI2cState, 0x00000013),
-        VMSTATE_UINT32_V(tsudatr, SCObcI2cState, 0x000000E5),
-        VMSTATE_UINT32_V(tbufr,   SCObcI2cState, 0x00000117),
-        VMSTATE_UINT32(tbsmplr,   SCObcI2cState),
-        VMSTATE_UINT32_V(bfsr,    SCObcI2cState, 0x0000002F),
+        VMSTATE_UINT32(enr,       SC_I2CM_State),
+        VMSTATE_UINT32(txfifor,   SC_I2CM_State),
+        VMSTATE_UINT32(bsr,       SC_I2CM_State),
+        VMSTATE_UINT32(isr,       SC_I2CM_State),
+        VMSTATE_UINT32(ier,       SC_I2CM_State),
+        VMSTATE_UINT32(fifosr,    SC_I2CM_State),
+        VMSTATE_UINT32(fiforr,    SC_I2CM_State),
+        VMSTATE_UINT32(ftlsr,     SC_I2CM_State),
+        VMSTATE_UINT32(scltsr,    SC_I2CM_State),
+        VMSTATE_UINT32_V(thdstar, SC_I2CM_State, 0x000000EF),
+        VMSTATE_UINT32_V(tsustor, SC_I2CM_State, 0x000000EF),
+        VMSTATE_UINT32_V(tsustar, SC_I2CM_State, 0x00000117),
+        VMSTATE_UINT32_V(thighr,  SC_I2CM_State, 0x000000E5),
+        VMSTATE_UINT32_V(thddatr, SC_I2CM_State, 0x00000013),
+        VMSTATE_UINT32_V(tsudatr, SC_I2CM_State, 0x000000E5),
+        VMSTATE_UINT32_V(tbufr,   SC_I2CM_State, 0x00000117),
+        VMSTATE_UINT32(tbsmplr,   SC_I2CM_State),
+        VMSTATE_UINT32_V(bfsr,    SC_I2CM_State, 0x0000002F),
         VMSTATE_END_OF_LIST()
     }
 };
 
-static void scobc_i2c_init(Object* obj)
+static void sc_i2cm_init(Object* obj)
 {
     DeviceState* dev = DEVICE(obj);
-    SCObcI2cState* s = SCOBC_I2C(obj);
+    SC_I2CM_State* s = SC_I2CM(obj);
     SysBusDevice* sbd = SYS_BUS_DEVICE(obj);
     I2CBus* bus;
 
@@ -402,13 +447,13 @@ static void scobc_i2c_init(Object* obj)
     bus = i2c_init_bus(dev, "i2c");
     s->bus = bus;
     memory_region_init_io(
-        &s->iomem, obj, &scobc_i2c_ops, s, "i2c", 0x10000);
+        &s->iomem, obj, &sc_i2cm_ops, s, "i2c", 0x10000);
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
-static void scobc_i2c_reset_enter(Object* obj, ResetType type)
+static void sc_i2cm_reset_enter(Object* obj, ResetType type)
 {
-    SCObcI2cState* s = SCOBC_I2C(obj);
+    SC_I2CM_State* s = SC_I2CM(obj);
 
     if (s->i2cm_status != I2CM_STAT_IDLE) {
         i2c_end_transfer(s->bus);
@@ -416,9 +461,9 @@ static void scobc_i2c_reset_enter(Object* obj, ResetType type)
     }
 }
 
-static void scobc_i2c_reset_hold(Object* obj)
+static void sc_i2cm_reset_hold(Object* obj)
 {
-    SCObcI2cState* s = SCOBC_I2C(obj);
+    SC_I2CM_State* s = SC_I2CM(obj);
 
     s->ier_shadow_mask = 0xFFFFFFFF;
     i2c_fifo_init(&s->tx_fifo);
@@ -445,38 +490,38 @@ static void scobc_i2c_reset_hold(Object* obj)
     s->bfsr = 0x0000002F;
 }
 
-static void scobc_i2c_reset_exit(Object* obj)
+static void sc_i2cm_reset_exit(Object* obj)
 {
-    SCObcI2cState* s = SCOBC_I2C(obj);
+    SC_I2CM_State* s = SC_I2CM(obj);
 
-    scobc_i2c_update(s);
+    sc_i2cm_update(s);
 }
 
-static void scobc_i2c_class_init(ObjectClass* klass, void* data)
+static void sc_i2cm_class_init(ObjectClass* klass, void* data)
 {
     DeviceClass* dc = DEVICE_CLASS(klass);
     ResettableClass* rc = RESETTABLE_CLASS(klass);
 
-    rc->phases.enter = scobc_i2c_reset_enter;
-    rc->phases.hold  = scobc_i2c_reset_hold;
-    rc->phases.exit  = scobc_i2c_reset_exit;
+    rc->phases.enter = sc_i2cm_reset_enter;
+    rc->phases.hold  = sc_i2cm_reset_hold;
+    rc->phases.exit  = sc_i2cm_reset_exit;
     dc->vmsd = &vmstate_scobc_i2c;
 }
 
-static const TypeInfo   scobc_i2c_info = {
-    .name = TYPE_SCOBC_I2C,
+static const TypeInfo   sc_i2cm_info = {
+    .name = TYPE_SC_I2CM,
     .parent = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(SCObcI2cState),
-    .instance_init = scobc_i2c_init,
-    .class_init = scobc_i2c_class_init,
+    .instance_size = sizeof(SC_I2CM_State),
+    .instance_init = sc_i2cm_init,
+    .class_init = sc_i2cm_class_init,
 };
 
 
-static void scobc_i2c_register_types(void)
+static void sc_i2cm_register_types(void)
 {
-    type_register_static(&scobc_i2c_info);
+    type_register_static(&sc_i2cm_info);
 }
-type_init(scobc_i2c_register_types)
+type_init(sc_i2cm_register_types)
 
 /*
  * End of File
