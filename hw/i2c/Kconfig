@@ -50,6 +50,6 @@ config BCM2835_I2C
     bool
     select I2C
 
-config SC_OBC_I2C
+config SC_I2CM
     bool
     select I2C
