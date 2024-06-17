@@ -7,7 +7,7 @@
 #include "hw/arm/boot.h"
 #include "hw/boards.h"
 #include "hw/clock.h"
-#include "hw/i2c/sc_obc_i2c.h"
+#include "hw/i2c/sc_i2cm.h"
 #include "hw/irq.h"
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
@@ -125,7 +125,7 @@ static void scsat1_init(MachineState* ms)
     sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0, 0x4f010000);
     sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(cpu, 0));
 
-    i2c = sysbus_create_simple(TYPE_SCOBC_I2C, 0x4F030000, qdev_get_gpio_in(cpu, 7));
+    i2c = sysbus_create_simple(TYPE_SC_I2CM, 0x4F030000, qdev_get_gpio_in(cpu, 7));
 
     /* create and attach the I2C temperature sensor */
     i2c_bus = (I2CBus*)qdev_get_child_bus(i2c, "i2c");
